@@ -1,0 +1,12 @@
+.claude/
+.vscode/
+
+build/
+firmware/build/
+firmware/managed_components/
+
+xiaozhi-esp32/
+
+*.pyc
+__pycache__/
+

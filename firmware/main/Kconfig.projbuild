@@ -1,0 +1,35 @@
+menu "Korvo-1 Network"
+
+config KORVO_WIFI_SSID
+    string "WiFi SSID"
+    default ""
+    help
+        WiFi SSID used by the standalone ESP32-S31-Korvo-1 firmware.
+
+config KORVO_WIFI_PASSWORD
+    string "WiFi password"
+    default ""
+    help
+        WiFi password. Leave empty for an open network.
+
+config KORVO_WS_HOST
+    string "WebSocket host"
+    default "120.25.213.109"
+    help
+        Hostname or IP address of the xiaozhi WebSocket backend.
+
+config KORVO_WS_PORT
+    int "WebSocket port"
+    default 8989
+
+config KORVO_WS_PATH
+    string "WebSocket path"
+    default "/xiaozhi/v1/"
+
+config KORVO_WS_TOKEN
+    string "WebSocket authorization token"
+    default ""
+    help
+        Optional Authorization header value.
+
+endmenu
