@@ -38,13 +38,6 @@
 - 连接状态实时指示
 - 掉线后"Chat Again"重连按钮
 
-### 🎧 蓝牙耳机音频路由
-- 经典蓝牙 HFP AG（Audio Gateway）模式
-- 耳机配对后自动路由音频（mSBC 16kHz 宽频语音）
-- 支持蓝牙麦克风输入
-- SCO 链路拥塞时自动回退至本地扬声器
-- WiFi 共存优化（MAX_MODEM 省电模式）
-
 ### 💾 OTA 升级
 - 3 个 OTA 分区（factory + 2 个升级槽）
 - Spiffs 数据分区（字库等资源）
@@ -157,18 +150,6 @@ Korvo-1 Bluetooth Headset →
     Device name         # 广播名称
     Auto connect        # 目标耳机名称或 MAC
 ```
-
-## 蓝牙耳机说明
-
-当前已实现的蓝牙音频路由：
-
-- HFP AG 模式（耳机连接 ESP32）
-- mSBC 编解码（16kHz 宽频）
-- 麦克风上行：耳机麦克风 → ESP32 → WebSocket
-- 扬声器下行：WebSocket TTS → ESP32 → 耳机
-- SCO 链路压力自动感知，拥塞时回退本地扬声器
-
-> **注意**：受 ESP32 单射频限制，TTS 播放期间 WebSocket 持续接收数据可能影响 SCO 稳定性。系统设计了背压 + 拥塞回退机制，保证音频不中断。
 
 ## WebSocket 协议
 
