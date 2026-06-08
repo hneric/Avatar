@@ -34,6 +34,7 @@ static QueueHandle_t s_audio_queue = NULL;
 static volatile bool s_audio_streaming = false;
 static volatile bool s_listen_stop_requested = false;
 static volatile bool s_task_running = false;
+static volatile bool s_presence_greeting_requested = false;
 static char s_session_id[96] = { 0 };
 
 static void notify_status(websocket_client_status_t status, const char *detail)
@@ -251,6 +252,25 @@ static bool websocket_start_audio_stream(esp_transport_handle_t ws, const char *
     return true;
 }
 
+static bool websocket_send_presence_greeting(esp_transport_handle_t ws)
+{
+    const char *greeting_text = "My phone is nearby. Please greet me in Chinese.";
+    char message[256];
+    snprintf(message, sizeof(message),
+        "{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"detect\","
+        "\"text\":\"My phone is nearby. Please greet me in Chinese.\"}",
+        s_session_id);
+
+    int ret = websocket_send_text(ws, message, 3000);
+    ESP_LOGI(TAG, "presence greeting sent: %d bytes, text=%s", ret, greeting_text);
+    if (ret >= 0) {
+        notify_status(WEBSOCKET_CLIENT_STATUS_THINKING, "Presence greeting sent");
+        return true;
+    }
+    notify_status(WEBSOCKET_CLIENT_STATUS_ERROR, "Presence greeting failed");
+    return false;
+}
+
 static void websocket_handle_chat_message(esp_transport_handle_t ws, const char *data)
 {
     char type[16];
@@ -259,6 +279,12 @@ static void websocket_handle_chat_message(esp_transport_handle_t ws, const char 
     copy_json_string_value(data, "type", type, sizeof(type));
     copy_json_string_value(data, "state", state, sizeof(state));
     copy_json_string_value(data, "text", text, sizeof(text));
+
+    if (strcmp(type, "stt") == 0 && text[0]) {
+        ESP_LOGI(TAG, "user text: %s", text);
+    } else if (strcmp(type, "tts") == 0 && text[0]) {
+        ESP_LOGI(TAG, "tts text state=%s: %s", state[0] ? state : "-", text);
+    }
 
     if (s_chat_cb && (strcmp(type, "stt") == 0 || strcmp(type, "tts") == 0)) {
         s_chat_cb(type, state, text);
@@ -383,6 +409,7 @@ static void websocket_task(void *arg)
 
     bool hello_accepted = false;
     bool restart_listen_after_tts = false;
+    bool tts_response_active = false;
     int64_t restart_listen_earliest = 0;
     int64_t restart_listen_deadline = 0;
     int64_t hello_deadline = esp_timer_get_time() + 30000000LL;
@@ -393,6 +420,13 @@ static void websocket_task(void *arg)
         if (s_listen_stop_requested) {
             websocket_stop_audio_stream(ws, "vad");
         }
+        if (hello_accepted && s_presence_greeting_requested) {
+            s_presence_greeting_requested = false;
+            if (s_audio_streaming) {
+                websocket_stop_audio_stream(ws, "presence greeting");
+            }
+            websocket_send_presence_greeting(ws);
+        }
         int len = esp_transport_read(ws, rx, sizeof(rx) - 1, hello_accepted ? 50 : 1000);
         if (len > 0) {
             idle_reads = 0;
@@ -401,11 +435,24 @@ static void websocket_task(void *arg)
                 rx[len] = 0;
                 if (parse_server_hello(rx, len)) {
                     hello_accepted = true;
-                    websocket_start_audio_stream(ws, "hello accepted");
+                    if (s_presence_greeting_requested) {
+                        s_presence_greeting_requested = false;
+                        websocket_send_presence_greeting(ws);
+                    } else {
+                        websocket_start_audio_stream(ws, "hello accepted");
+                    }
                 } else {
                     websocket_handle_mcp_message(ws, rx);
-                    if (strstr(rx, "\"type\":\"tts\"") && strstr(rx, "\"state\":\"stop\"")) {
+                    char msg_type[16];
+                    char msg_state[24];
+                    copy_json_string_value(rx, "type", msg_type, sizeof(msg_type));
+                    copy_json_string_value(rx, "state", msg_state, sizeof(msg_state));
+                    if (strcmp(msg_type, "tts") == 0 && strcmp(msg_state, "start") == 0) {
+                        restart_listen_after_tts = false;
+                        tts_response_active = true;
+                    } else if (strcmp(msg_type, "tts") == 0 && strcmp(msg_state, "stop") == 0 && tts_response_active) {
                         restart_listen_after_tts = true;
+                        tts_response_active = false;
                         restart_listen_earliest = esp_timer_get_time() + 500000LL;
                         restart_listen_deadline = esp_timer_get_time() + 3000000LL;
                     }
@@ -555,4 +602,9 @@ void websocket_client_request_listen_stop(void)
     if (s_audio_streaming) {
         s_listen_stop_requested = true;
     }
+}
+
+void websocket_client_request_presence_greeting(void)
+{
+    s_presence_greeting_requested = true;
 }

@@ -36,3 +36,4 @@ bool websocket_client_is_running(void);
 bool websocket_client_is_audio_streaming(void);
 esp_err_t websocket_client_send_audio_frame(const uint8_t *data, size_t bytes);
 void websocket_client_request_listen_stop(void);
+void websocket_client_request_presence_greeting(void);

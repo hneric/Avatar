@@ -12,6 +12,12 @@ config KORVO_WIFI_PASSWORD
     help
         WiFi password. Leave empty for an open network.
 
+config KORVO_BLE_PROV_POP
+    string "BLE provisioning proof of possession"
+    default "s31pop"
+    help
+        Proof-of-possession used by BLE Wi-Fi provisioning security version 1.
+
 config KORVO_WS_HOST
     string "WebSocket host"
     default "120.25.213.109"

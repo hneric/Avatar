@@ -1,12 +1,16 @@
 .claude/
 .vscode/
+.tmp/
 
 build/
 firmware/build/
 firmware/managed_components/
+android-app/.gradle/
+android-app/.idea/
+android-app/local.properties
 
 xiaozhi-esp32/
+doc/
 
 *.pyc
 __pycache__/
-

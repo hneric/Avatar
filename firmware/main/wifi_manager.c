@@ -1,5 +1,6 @@
 #include "wifi_manager.h"
 
+#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -9,7 +10,11 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
+#include "protocomm_ble.h"
+#include "protocomm_security.h"
 #include "sdkconfig.h"
+#include "network_provisioning/manager.h"
+#include "network_provisioning/scheme_ble.h"
 
 static const char *TAG = "wifi";
 
@@ -23,6 +28,22 @@ static bool s_connected;
 static bool s_connecting;
 static bool s_initialized;
 static bool s_started;
+static bool s_prov_initialized;
+static wifi_manager_prov_status_cb_t s_prov_status_cb;
+
+static void wifi_manager_notify_prov(wifi_manager_prov_state_t state, const char *detail)
+{
+    if (s_prov_status_cb) {
+        s_prov_status_cb(state, detail);
+    }
+}
+
+static void wifi_manager_get_service_name(char *service_name, size_t service_name_size)
+{
+    uint8_t mac[6] = { 0 };
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    snprintf(service_name, service_name_size, "S31_%02X%02X%02X", mac[3], mac[4], mac[5]);
+}
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
@@ -49,6 +70,66 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_connected = true;
         s_connecting = false;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        wifi_manager_notify_prov(WIFI_MANAGER_PROV_CONNECTED, NULL);
+    } else if (event_base == NETWORK_PROV_EVENT) {
+        switch (event_id) {
+        case NETWORK_PROV_START:
+            ESP_LOGI(TAG, "BLE provisioning started");
+            wifi_manager_notify_prov(WIFI_MANAGER_PROV_ADVERTISING, NULL);
+            break;
+        case NETWORK_PROV_WIFI_CRED_RECV: {
+            wifi_sta_config_t *wifi_sta_cfg = (wifi_sta_config_t *)event_data;
+            char detail[48];
+            snprintf(detail, sizeof(detail), "SSID: %s", (const char *)wifi_sta_cfg->ssid);
+            ESP_LOGI(TAG, "received WiFi credentials for %s", (const char *)wifi_sta_cfg->ssid);
+            wifi_manager_notify_prov(WIFI_MANAGER_PROV_CRED_RECV, detail);
+            break;
+        }
+        case NETWORK_PROV_WIFI_CRED_FAIL: {
+            network_prov_wifi_sta_fail_reason_t *reason = (network_prov_wifi_sta_fail_reason_t *)event_data;
+            const char *detail = "WiFi connect failed";
+            if (reason && *reason == NETWORK_PROV_WIFI_STA_AUTH_ERROR) {
+                detail = "WiFi auth failed";
+            } else if (reason && *reason == NETWORK_PROV_WIFI_STA_AP_NOT_FOUND) {
+                detail = "WiFi AP not found";
+            }
+            ESP_LOGE(TAG, "provisioning failed: %s", detail);
+            wifi_manager_notify_prov(WIFI_MANAGER_PROV_CRED_FAIL, detail);
+            network_prov_mgr_reset_wifi_sm_state_on_failure();
+            break;
+        }
+        case NETWORK_PROV_WIFI_CRED_SUCCESS:
+            ESP_LOGI(TAG, "provisioning credentials accepted");
+            wifi_manager_notify_prov(WIFI_MANAGER_PROV_CRED_SUCCESS, NULL);
+            break;
+        case NETWORK_PROV_END:
+            ESP_LOGI(TAG, "BLE provisioning ended");
+            wifi_manager_notify_prov(WIFI_MANAGER_PROV_CLOSED, NULL);
+            if (s_prov_initialized) {
+                network_prov_mgr_deinit();
+                s_prov_initialized = false;
+            }
+            break;
+        default:
+            break;
+        }
+    } else if (event_base == PROTOCOMM_TRANSPORT_BLE_EVENT) {
+        if (event_id == PROTOCOMM_TRANSPORT_BLE_CONNECTED) {
+            ESP_LOGI(TAG, "BLE client connected");
+            wifi_manager_notify_prov(WIFI_MANAGER_PROV_BLE_CONNECTED, NULL);
+        } else if (event_id == PROTOCOMM_TRANSPORT_BLE_DISCONNECTED) {
+            ESP_LOGI(TAG, "BLE client disconnected");
+            wifi_manager_notify_prov(WIFI_MANAGER_PROV_ADVERTISING, NULL);
+        }
+    } else if (event_base == PROTOCOMM_SECURITY_SESSION_EVENT) {
+        if (event_id == PROTOCOMM_SECURITY_SESSION_SETUP_OK) {
+            ESP_LOGI(TAG, "BLE provisioning secure session established");
+            wifi_manager_notify_prov(WIFI_MANAGER_PROV_SECURITY_OK, NULL);
+        } else if (event_id == PROTOCOMM_SECURITY_SESSION_INVALID_SECURITY_PARAMS ||
+                   event_id == PROTOCOMM_SECURITY_SESSION_CREDENTIALS_MISMATCH) {
+            ESP_LOGE(TAG, "BLE provisioning security handshake failed");
+            wifi_manager_notify_prov(WIFI_MANAGER_PROV_ERROR, "Security handshake failed");
+        }
     }
 }
 
@@ -84,6 +165,12 @@ static esp_err_t wifi_manager_init_once(void)
         &wifi_event_handler, NULL, &instance_any_id), TAG, "wifi handler");
     ESP_RETURN_ON_ERROR(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
         &wifi_event_handler, NULL, &instance_got_ip), TAG, "ip handler");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID,
+        &wifi_event_handler, NULL), TAG, "prov handler");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID,
+        &wifi_event_handler, NULL), TAG, "ble handler");
+    ESP_RETURN_ON_ERROR(esp_event_handler_register(PROTOCOMM_SECURITY_SESSION_EVENT, ESP_EVENT_ANY_ID,
+        &wifi_event_handler, NULL), TAG, "security handler");
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set mode");
     s_initialized = true;
@@ -162,6 +249,86 @@ esp_err_t wifi_manager_start(void)
         return ESP_ERR_INVALID_STATE;
     }
     return wifi_manager_connect(CONFIG_KORVO_WIFI_SSID, CONFIG_KORVO_WIFI_PASSWORD);
+}
+
+esp_err_t wifi_manager_start_ble_provisioning(wifi_manager_prov_status_cb_t cb)
+{
+    s_prov_status_cb = cb;
+    ESP_RETURN_ON_ERROR(wifi_manager_init_once(), TAG, "init wifi");
+    if (s_prov_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    network_prov_mgr_config_t config = {
+        .scheme = network_prov_scheme_ble,
+        .scheme_event_handler = NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BT,
+        .app_event_handler = NETWORK_PROV_EVENT_HANDLER_NONE,
+        .network_prov_wifi_conn_cfg = {
+            .wifi_conn_attempts = WIFI_MAX_RETRY,
+        },
+    };
+
+    ESP_RETURN_ON_ERROR(network_prov_mgr_init(config), TAG, "prov init");
+    s_prov_initialized = true;
+
+    bool provisioned = false;
+    esp_err_t ret = network_prov_mgr_is_wifi_provisioned(&provisioned);
+    if (ret != ESP_OK) {
+        network_prov_mgr_deinit();
+        s_prov_initialized = false;
+        return ret;
+    }
+
+    if (provisioned) {
+        ESP_LOGI(TAG, "already provisioned; starting WiFi STA");
+        wifi_manager_notify_prov(WIFI_MANAGER_PROV_ALREADY_PROVISIONED, NULL);
+        network_prov_mgr_deinit();
+        s_prov_initialized = false;
+        ESP_RETURN_ON_ERROR(wifi_manager_start_sta(), TAG, "start sta");
+        s_connecting = true;
+        ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "connect stored wifi");
+        return ESP_OK;
+    }
+
+    char service_name[16] = { 0 };
+    wifi_manager_get_service_name(service_name, sizeof(service_name));
+
+    uint8_t service_uuid[16] = {
+        0xb4, 0xdf, 0x5a, 0x1c, 0x3f, 0x6b, 0xf4, 0xbf,
+        0xea, 0x4a, 0x82, 0x03, 0x31, 0x90, 0x1a, 0x02,
+    };
+    ESP_RETURN_ON_ERROR(network_prov_scheme_ble_set_service_uuid(service_uuid), TAG, "set ble uuid");
+
+    const char *pop = CONFIG_KORVO_BLE_PROV_POP;
+    network_prov_security_t security = NETWORK_PROV_SECURITY_1;
+    network_prov_security1_params_t *sec_params = (network_prov_security1_params_t *)pop;
+
+    ESP_LOGI(TAG, "starting BLE provisioning service=%s pop=%s", service_name, pop);
+    ESP_LOGI(TAG, "provisioning QR payload: {\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"ble\"}",
+             service_name, pop);
+    ret = network_prov_mgr_start_provisioning(security, (const void *)sec_params, service_name, NULL);
+    if (ret != ESP_OK) {
+        network_prov_mgr_deinit();
+        s_prov_initialized = false;
+        wifi_manager_notify_prov(WIFI_MANAGER_PROV_ERROR, esp_err_to_name(ret));
+        return ret;
+    }
+
+    wifi_manager_notify_prov(WIFI_MANAGER_PROV_ADVERTISING, service_name);
+    return ESP_OK;
+}
+
+esp_err_t wifi_manager_stop_ble_provisioning(void)
+{
+    if (!s_prov_initialized) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "stopping BLE provisioning");
+    s_prov_initialized = false;
+    esp_err_t ret = network_prov_mgr_deinit();
+    wifi_manager_notify_prov(WIFI_MANAGER_PROV_CLOSED, NULL);
+    return ret;
 }
 
 bool wifi_manager_is_connected(void)

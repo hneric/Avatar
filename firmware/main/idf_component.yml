@@ -4,3 +4,4 @@ dependencies:
   espressif/esp_codec_dev: ~1.5.6
   78/esp-opus: ^1.0.5
   espressif/esp_lcd_touch_gt1151: ^1
+  espressif/network_provisioning: ^1.0.5

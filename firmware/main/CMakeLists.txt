@@ -9,6 +9,7 @@ idf_component_register(
         ${EMOJI_SRCS}
         ${AVATAR_SRCS}
         "opus_encoder.c"
+        "presence_service.c"
         "wifi_manager.c"
         "websocket_client.c"
         "main.c"
@@ -23,8 +24,11 @@ idf_component_register(
         esp_netif
         esp_event
         esp_timer
+        bt
+        protocomm
         nvs_flash
         tcp_transport
+        espressif__network_provisioning
         espressif__esp_codec_dev
         "78__esp-opus"
         espressif__esp_lcd_touch_gt1151

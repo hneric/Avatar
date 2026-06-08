@@ -18,12 +18,14 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "sdkconfig.h"
 #include "esp_codec_dev_defaults.h"
 #include "esp_codec_dev.h"
 #include "lvgl.h"
 #include "board.h"
 #include "wifi_manager.h"
 #include "websocket_client.h"
+#include "presence_service.h"
 #include "opus_encoder.h"
 #include "tts_player.h"
 #include "cbin_font.h"
@@ -54,13 +56,16 @@ static _lock_t lvgl_lock;
 static lv_display_t *lvgl_disp = NULL;
 static lv_obj_t *status_label = NULL;
 static lv_obj_t *mic_label = NULL;
+static lv_obj_t *user_text_box = NULL;
 static lv_obj_t *user_text_label = NULL;
+static lv_obj_t *assistant_text_box = NULL;
 static lv_obj_t *assistant_text_label = NULL;
 static lv_obj_t *avatar_head = NULL;
 static lv_obj_t *avatar_left_eye = NULL;
 static lv_obj_t *avatar_right_eye = NULL;
 static lv_obj_t *avatar_mouth = NULL;
 static lv_obj_t *avatar_tongue = NULL;
+static lv_obj_t *avatar_img_container = NULL;
 static lv_obj_t *avatar_img_base = NULL;
 static lv_obj_t *avatar_img_mouth = NULL;
 static lv_obj_t *avatar_img_blink = NULL;
@@ -70,6 +75,11 @@ static lv_obj_t *reconnect_btn = NULL;
 static lv_font_t *dialog_font = NULL;
 static esp_lcd_touch_handle_t tp_handle = NULL;
 static lv_obj_t *wifi_panel = NULL;
+static lv_obj_t *wifi_prov_title_label = NULL;
+static lv_obj_t *wifi_prov_state_label = NULL;
+static lv_obj_t *wifi_prov_service_label = NULL;
+static lv_obj_t *wifi_prov_pop_label = NULL;
+static lv_obj_t *wifi_manual_panel = NULL;
 static lv_obj_t *wifi_dropdown = NULL;
 static lv_obj_t *wifi_password_ta = NULL;
 static lv_obj_t *wifi_keyboard = NULL;
@@ -77,8 +87,11 @@ static lv_obj_t *selected_wifi_label = NULL;
 static char selected_wifi_ssid[33];
 static char selected_wifi_password[65] = "18689922388";
 static char wifi_options[20 * 40];
-static char user_text[256] = "You: --";
-static char assistant_text[512] = "Esp32: --";
+static bool websocket_start_requested = false;
+static bool presence_start_task_running = false;
+static int64_t presence_last_nearby_us = 0;
+static char user_text[384] = "You: --";
+static char assistant_text[1024] = "Esp32: --";
 
 typedef enum {
     AVATAR_STATE_IDLE = 0,
@@ -108,6 +121,7 @@ static esp_codec_dev_handle_t codec_handle = NULL;
 #define VAD_SPEECH_FRAMES_TO_START 2  /* 2 * 60 ms */
 #define VAD_STARTUP_IGNORE_FRAMES 5   /* 5 * 60 ms ~= 300 ms */
 #define VAD_MAX_STREAM_FRAMES 200     /* 200 * 60 ms ~= 12 seconds */
+#define PRESENCE_NEARBY_COOLDOWN_US 15000000LL /* 15 seconds */
 
 static void ui_set_status(const char *text)
 {
@@ -170,12 +184,13 @@ static void ui_set_avatar_visible_locked(bool visible)
     avatar_visible = visible;
     lv_obj_t *objs[] = {
         avatar_head,
-        avatar_img_base,
-        avatar_img_mouth,
+        avatar_img_container,
         avatar_img_blink,
         avatar_img_expression,
         avatar_state_label,
+        user_text_box,
         user_text_label,
+        assistant_text_box,
         assistant_text_label,
     };
     for (size_t i = 0; i < sizeof(objs) / sizeof(objs[0]); i++) {
@@ -210,7 +225,7 @@ static void avatar_set_image_layer(lv_obj_t *obj, const croc_avatar_layer_t *lay
         return;
     }
     lv_image_set_src(obj, layer->img);
-    lv_obj_align(obj, LV_ALIGN_TOP_LEFT, AVATAR_IMAGE_X + layer->x, AVATAR_IMAGE_Y + layer->y);
+    lv_obj_align(obj, LV_ALIGN_TOP_LEFT, layer->x, layer->y);
 }
 #endif
 
@@ -376,9 +391,17 @@ static void ui_set_dialog_text(const char *user, const char *assistant)
     _lock_acquire(&lvgl_lock);
     if (user && user_text_label) {
         lv_label_set_text(user_text_label, user);
+        if (user_text_box) {
+            lv_obj_update_layout(user_text_box);
+            lv_obj_scroll_to_y(user_text_box, LV_COORD_MAX, LV_ANIM_ON);
+        }
     }
     if (assistant && assistant_text_label) {
         lv_label_set_text(assistant_text_label, assistant);
+        if (assistant_text_box) {
+            lv_obj_update_layout(assistant_text_box);
+            lv_obj_scroll_to_y(assistant_text_box, LV_COORD_MAX, LV_ANIM_ON);
+        }
     }
     _lock_release(&lvgl_lock);
 }
@@ -446,12 +469,11 @@ static void ui_init_dialog_font(void)
     dialog_font = cbin_font_create((uint8_t *)font_puhui_common_16_4_bin_start);
     if (!dialog_font) {
         ESP_LOGW(TAG, "xiaozhi cbin font create failed; use LVGL CJK font");
-        return;
-    }
-
-    const lv_font_t *emoji_font = font_emoji_32_init();
-    if (emoji_font) {
-        dialog_font->fallback = emoji_font;
+    } else {
+        const lv_font_t *emoji_font = font_emoji_32_init();
+        if (emoji_font) {
+            dialog_font->fallback = emoji_font;
+        }
     }
 
     ESP_LOGI(TAG, "xiaozhi dialog font ready: %u bytes",
@@ -842,10 +864,188 @@ static void btn_beep_cb(lv_event_t *e)
     if (status_label) lv_label_set_text(status_label, "Ready");
 }
 
+static void websocket_configure_callbacks(void)
+{
+    websocket_client_set_status_callback(websocket_status_cb);
+    websocket_client_set_binary_callback(websocket_binary_cb);
+    websocket_client_set_tts_state_callback(websocket_tts_state_cb);
+    websocket_client_set_chat_callback(websocket_chat_cb);
+    websocket_client_set_can_restart_listen_callback(websocket_can_restart_listen_cb);
+}
+
+static void websocket_reconnect_task(void *arg)
+{
+    (void)arg;
+    websocket_configure_callbacks();
+    if (websocket_client_is_running()) {
+        ui_set_status("WebSocket already running");
+        vTaskDelete(NULL);
+    }
+
+    ui_set_reconnect_visible(false);
+    ui_set_status("WebSocket reconnecting...");
+    esp_err_t ret = websocket_client_start();
+    if (ret == ESP_ERR_INVALID_STATE) {
+        ui_set_status("WebSocket not configured");
+        ui_set_reconnect_visible(true);
+    } else if (ret != ESP_OK) {
+        ui_set_status("WebSocket reconnect failed");
+        ui_set_reconnect_visible(true);
+    }
+    vTaskDelete(NULL);
+}
+
+static void websocket_reconnect_cb(lv_event_t *e)
+{
+    (void)e;
+    xTaskCreate(websocket_reconnect_task, "ws_reconnect", 4096, NULL, 3, NULL);
+}
+
+static void presence_nearby_task(void *arg)
+{
+    char *payload = (char *)arg;
+    int64_t now = esp_timer_get_time();
+    if (presence_last_nearby_us != 0 &&
+        now - presence_last_nearby_us < PRESENCE_NEARBY_COOLDOWN_US) {
+        ESP_LOGI(TAG, "presence nearby ignored by cooldown: %s", payload ? payload : "");
+        free(payload);
+        vTaskDelete(NULL);
+    }
+    presence_last_nearby_us = now;
+
+    ESP_LOGI(TAG, "presence nearby trigger: %s", payload ? payload : "");
+    free(payload);
+
+    if (!wifi_manager_is_connected()) {
+        ui_set_status("Phone nearby | WiFi offline");
+        vTaskDelete(NULL);
+    }
+
+    websocket_configure_callbacks();
+    websocket_client_request_presence_greeting();
+    if (websocket_client_is_running()) {
+        ui_set_status("Phone nearby | Greeting requested");
+        vTaskDelete(NULL);
+    }
+
+    ui_set_status("Phone nearby | WebSocket connecting");
+    esp_err_t ret = websocket_client_start();
+    if (ret == ESP_OK) {
+        ui_set_status("Phone nearby | WebSocket starting");
+    } else if (ret == ESP_ERR_INVALID_STATE) {
+        ui_set_status("Phone nearby | WebSocket not configured");
+    } else {
+        ui_set_status("Phone nearby | WebSocket failed");
+    }
+    vTaskDelete(NULL);
+}
+
+static void presence_nearby_cb(const char *payload)
+{
+    char *copy = strdup(payload ? payload : "");
+    if (!copy) {
+        return;
+    }
+    if (xTaskCreate(presence_nearby_task, "presence_nearby", 4096, copy, 3, NULL) != pdPASS) {
+        free(copy);
+    }
+}
+
+static void presence_start_task(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 20; i++) {
+        if (presence_service_is_running()) {
+            presence_start_task_running = false;
+            vTaskDelete(NULL);
+        }
+        esp_err_t ret = presence_service_start(presence_nearby_cb);
+        if (ret == ESP_OK) {
+            ui_set_status("Presence BLE ready");
+            presence_start_task_running = false;
+            vTaskDelete(NULL);
+        }
+        ESP_LOGW(TAG, "start presence service failed (%d/20): %s", i + 1, esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+    presence_start_task_running = false;
+    vTaskDelete(NULL);
+}
+
+static void start_presence_service_async(void)
+{
+    if (presence_service_is_running() || presence_start_task_running) {
+        return;
+    }
+    presence_start_task_running = true;
+    if (xTaskCreate(presence_start_task, "presence_start", 4096, NULL, 3, NULL) != pdPASS) {
+        presence_start_task_running = false;
+    }
+}
+
+static void ui_set_manual_wifi_visible_locked(bool visible)
+{
+    lv_obj_t *ble_objs[] = {
+        wifi_prov_title_label,
+        wifi_prov_state_label,
+        wifi_prov_service_label,
+        wifi_prov_pop_label,
+    };
+    for (size_t i = 0; i < sizeof(ble_objs) / sizeof(ble_objs[0]); i++) {
+        if (!ble_objs[i]) {
+            continue;
+        }
+        if (visible) {
+            lv_obj_add_flag(ble_objs[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(ble_objs[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (wifi_manual_panel) {
+        if (visible) {
+            lv_obj_remove_flag(wifi_manual_panel, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(wifi_manual_panel, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (!visible && wifi_keyboard) {
+        lv_obj_add_flag(wifi_keyboard, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(wifi_keyboard, NULL);
+    }
+    lv_obj_invalidate(lv_scr_act());
+}
+
+static void ui_set_manual_wifi_visible(bool visible)
+{
+    _lock_acquire(&lvgl_lock);
+    ui_set_manual_wifi_visible_locked(visible);
+    _lock_release(&lvgl_lock);
+}
+
+static void manual_wifi_cb(lv_event_t *e)
+{
+    (void)e;
+    ui_set_manual_wifi_visible_locked(true);
+    lv_label_set_text(status_label, "Screen WiFi provisioning");
+}
+
+static void ble_wifi_cb(lv_event_t *e)
+{
+    (void)e;
+    ui_set_manual_wifi_visible_locked(false);
+    lv_label_set_text(status_label, "BLE provisioning");
+}
+
 static void wifi_ssid_selected_cb(lv_event_t *e)
 {
+    (void)e;
     lv_dropdown_get_selected_str(wifi_dropdown, selected_wifi_ssid, sizeof(selected_wifi_ssid));
-    if (selected_wifi_ssid[0] == 0 || strcmp(selected_wifi_ssid, "Scan WiFi first") == 0) return;
+    if (selected_wifi_ssid[0] == 0 ||
+        strcmp(selected_wifi_ssid, "Scan WiFi first") == 0 ||
+        strcmp(selected_wifi_ssid, "Scan failed") == 0 ||
+        strcmp(selected_wifi_ssid, "No networks found") == 0) {
+        return;
+    }
     lv_label_set_text_fmt(selected_wifi_label, "Selected: %s", selected_wifi_ssid);
     lv_label_set_text(status_label, "Enter password, then connect");
 }
@@ -864,6 +1064,7 @@ static void wifi_password_focus_cb(lv_event_t *e)
 
 static void wifi_scan_task(void *arg)
 {
+    (void)arg;
     ui_set_status("Scanning WiFi...");
 
     wifi_ap_record_t records[20] = { 0 };
@@ -903,61 +1104,19 @@ static void wifi_scan_task(void *arg)
 
 static void wifi_scan_cb(lv_event_t *e)
 {
+    (void)e;
     lv_label_set_text(status_label, "Starting scan...");
     xTaskCreate(wifi_scan_task, "wifi_scan", 6144, NULL, 3, NULL);
 }
 
-static void websocket_configure_callbacks(void)
-{
-    websocket_client_set_status_callback(websocket_status_cb);
-    websocket_client_set_binary_callback(websocket_binary_cb);
-    websocket_client_set_tts_state_callback(websocket_tts_state_cb);
-    websocket_client_set_chat_callback(websocket_chat_cb);
-    websocket_client_set_can_restart_listen_callback(websocket_can_restart_listen_cb);
-}
-
-static void websocket_reconnect_task(void *arg)
+static void wifi_start_chat_task(void *arg)
 {
     (void)arg;
-    websocket_configure_callbacks();
-    if (websocket_client_is_running()) {
-        ui_set_status("WebSocket already running");
-        vTaskDelete(NULL);
-    }
-
-    ui_set_reconnect_visible(false);
-    ui_set_status("WebSocket reconnecting...");
-    esp_err_t ret = websocket_client_start();
-    if (ret == ESP_ERR_INVALID_STATE) {
-        ui_set_status("WebSocket not configured");
-        ui_set_reconnect_visible(true);
-    } else if (ret != ESP_OK) {
-        ui_set_status("WebSocket reconnect failed");
-        ui_set_reconnect_visible(true);
-    }
-    vTaskDelete(NULL);
-}
-
-static void websocket_reconnect_cb(lv_event_t *e)
-{
-    (void)e;
-    xTaskCreate(websocket_reconnect_task, "ws_reconnect", 4096, NULL, 3, NULL);
-}
-
-static void wifi_connect_task(void *arg)
-{
-    ui_set_status("Connecting WiFi...");
-    esp_err_t ret = wifi_manager_connect(selected_wifi_ssid, selected_wifi_password);
-    if (ret != ESP_OK) {
-        ui_set_wifi_panel_visible(true);
-        ui_set_status("WiFi connect failed");
-        vTaskDelete(NULL);
-    }
-
     ui_set_wifi_panel_visible(false);
     ui_set_status("WiFi connected");
+    start_presence_service_async();
     websocket_configure_callbacks();
-    ret = websocket_client_start();
+    esp_err_t ret = websocket_client_start();
     if (ret == ESP_ERR_INVALID_STATE) {
         ui_set_status("WiFi connected | WebSocket not configured");
     } else {
@@ -966,8 +1125,33 @@ static void wifi_connect_task(void *arg)
     vTaskDelete(NULL);
 }
 
-static void wifi_connect_cb(lv_event_t *e)
+static void wifi_manual_connect_task(void *arg)
 {
+    (void)arg;
+    websocket_start_requested = true;
+    ui_set_status("Connecting WiFi...");
+
+    esp_err_t ret = wifi_manager_stop_ble_provisioning();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "stop BLE provisioning failed: %s", esp_err_to_name(ret));
+    }
+
+    ret = wifi_manager_connect(selected_wifi_ssid, selected_wifi_password);
+    if (ret != ESP_OK) {
+        websocket_start_requested = false;
+        ui_set_wifi_panel_visible(true);
+        ui_set_manual_wifi_visible(true);
+        ui_set_status("WiFi connect failed");
+        vTaskDelete(NULL);
+    }
+
+    xTaskCreate(wifi_start_chat_task, "wifi_start_chat", 6144, NULL, 3, NULL);
+    vTaskDelete(NULL);
+}
+
+static void wifi_manual_connect_cb(lv_event_t *e)
+{
+    (void)e;
     if (selected_wifi_ssid[0] == 0) {
         lv_label_set_text(status_label, "Select a WiFi first");
         return;
@@ -978,7 +1162,81 @@ static void wifi_connect_cb(lv_event_t *e)
     lv_obj_add_flag(wifi_keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_keyboard_set_textarea(wifi_keyboard, NULL);
     lv_label_set_text(status_label, "Connecting...");
-    xTaskCreate(wifi_connect_task, "wifi_connect", 6144, NULL, 3, NULL);
+    xTaskCreate(wifi_manual_connect_task, "wifi_manual_conn", 6144, NULL, 3, NULL);
+}
+
+static void ui_set_ble_prov_text(const char *state, const char *detail)
+{
+    _lock_acquire(&lvgl_lock);
+    if (wifi_prov_state_label && state) {
+        lv_label_set_text(wifi_prov_state_label, state);
+    }
+    if (wifi_prov_service_label && detail) {
+        lv_label_set_text(wifi_prov_service_label, detail);
+    }
+    lv_obj_invalidate(lv_scr_act());
+    _lock_release(&lvgl_lock);
+}
+
+static void ble_prov_status_cb(wifi_manager_prov_state_t state, const char *detail)
+{
+    switch (state) {
+    case WIFI_MANAGER_PROV_ADVERTISING:
+        ui_set_ble_prov_text("1. BLE advertising: waiting for phone", detail ? detail : NULL);
+        ui_set_status("BLE provisioning: advertising");
+        break;
+    case WIFI_MANAGER_PROV_BLE_CONNECTED:
+        ui_set_ble_prov_text("2. Phone connected: waiting security handshake", NULL);
+        ui_set_status("BLE phone connected");
+        break;
+    case WIFI_MANAGER_PROV_SECURITY_OK:
+        ui_set_ble_prov_text("2. Security handshake OK", NULL);
+        ui_set_status("BLE secure session ready");
+        break;
+    case WIFI_MANAGER_PROV_CRED_RECV:
+        ui_set_ble_prov_text("3. WiFi credentials received", detail);
+        ui_set_status("WiFi credentials received");
+        break;
+    case WIFI_MANAGER_PROV_CRED_FAIL:
+        ui_set_ble_prov_text("4. WiFi connect failed; retry in phone app", detail);
+        ui_set_status(detail ? detail : "WiFi provisioning failed");
+        break;
+    case WIFI_MANAGER_PROV_CRED_SUCCESS:
+        ui_set_ble_prov_text("4. WiFi connected; reporting status", NULL);
+        ui_set_status("WiFi provisioning successful");
+        break;
+    case WIFI_MANAGER_PROV_CONNECTED:
+        ui_set_ble_prov_text("5. BLE closing; starting chat", NULL);
+        if (!websocket_start_requested) {
+            websocket_start_requested = true;
+            xTaskCreate(wifi_start_chat_task, "wifi_start_chat", 6144, NULL, 3, NULL);
+        }
+        break;
+    case WIFI_MANAGER_PROV_CLOSED:
+        ui_set_ble_prov_text("5. BLE closed", NULL);
+        break;
+    case WIFI_MANAGER_PROV_ALREADY_PROVISIONED:
+        ui_set_ble_prov_text("Stored WiFi found; connecting", NULL);
+        ui_set_status("Connecting stored WiFi");
+        break;
+    case WIFI_MANAGER_PROV_ERROR:
+    default:
+        ui_set_ble_prov_text("BLE provisioning error", detail);
+        ui_set_status(detail ? detail : "BLE provisioning error");
+        break;
+    }
+}
+
+static void ble_provisioning_task(void *arg)
+{
+    (void)arg;
+    ui_set_status("Starting BLE provisioning...");
+    esp_err_t ret = wifi_manager_start_ble_provisioning(ble_prov_status_cb);
+    if (ret != ESP_OK) {
+        ui_set_ble_prov_text("BLE provisioning start failed", esp_err_to_name(ret));
+        ui_set_status("BLE provisioning start failed");
+    }
+    vTaskDelete(NULL);
 }
 
 static void create_ui(void)
@@ -1044,17 +1302,25 @@ static void create_ui(void)
 
 #if HAVE_CROC_AVATAR_ASSETS
     lv_obj_add_flag(avatar_head, LV_OBJ_FLAG_HIDDEN);
-    avatar_img_base = lv_image_create(scr);
+    avatar_img_container = lv_obj_create(scr);
+    lv_obj_remove_style_all(avatar_img_container);
+    lv_obj_set_size(avatar_img_container, 270, 270);
+    lv_obj_align(avatar_img_container, LV_ALIGN_TOP_LEFT, AVATAR_IMAGE_X, AVATAR_IMAGE_Y);
+    lv_obj_clear_flag(avatar_img_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(avatar_img_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_clip_corner(avatar_img_container, true, 0);
+
+    avatar_img_base = lv_image_create(avatar_img_container);
     avatar_set_image_layer(avatar_img_base, &croc_avatar_base_layer);
 
-    avatar_img_mouth = lv_image_create(scr);
+    avatar_img_mouth = lv_image_create(avatar_img_container);
     avatar_set_image_layer(avatar_img_mouth, &croc_avatar_mouth_0_layer);
 
-    avatar_img_blink = lv_image_create(scr);
+    avatar_img_blink = lv_image_create(avatar_img_container);
     avatar_set_image_layer(avatar_img_blink, &croc_avatar_blink_layer);
     lv_obj_add_flag(avatar_img_blink, LV_OBJ_FLAG_HIDDEN);
 
-    avatar_img_expression = lv_image_create(scr);
+    avatar_img_expression = lv_image_create(avatar_img_container);
     avatar_set_image_layer(avatar_img_expression, &croc_avatar_thinking_layer);
     lv_obj_add_flag(avatar_img_expression, LV_OBJ_FLAG_HIDDEN);
 #endif
@@ -1067,21 +1333,41 @@ static void create_ui(void)
     lv_obj_align(avatar_state_label, LV_ALIGN_TOP_LEFT, 40, 382);
     ui_set_avatar_visible_locked(false);
 
-    user_text_label = lv_label_create(scr);
+    user_text_box = lv_obj_create(scr);
+    lv_obj_remove_style_all(user_text_box);
+    lv_obj_set_size(user_text_box, 470, 68);
+    lv_obj_align(user_text_box, LV_ALIGN_TOP_LEFT, 300, 100);
+    lv_obj_set_style_bg_opa(user_text_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(user_text_box, 8, 0);
+    lv_obj_set_style_pad_all(user_text_box, 8, 0);
+    lv_obj_set_scroll_dir(user_text_box, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(user_text_box, LV_SCROLLBAR_MODE_AUTO);
+
+    user_text_label = lv_label_create(user_text_box);
     lv_label_set_text(user_text_label, user_text);
     lv_obj_set_style_text_color(user_text_label, lv_color_hex(0xe2e8f0), 0);
     ui_apply_chinese_font(user_text_label);
-    lv_obj_set_width(user_text_label, 430);
+    lv_obj_set_width(user_text_label, 454);
     lv_label_set_long_mode(user_text_label, LV_LABEL_LONG_WRAP);
-    lv_obj_align(user_text_label, LV_ALIGN_TOP_LEFT, 340, 106);
+    lv_obj_align(user_text_label, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    assistant_text_label = lv_label_create(scr);
+    assistant_text_box = lv_obj_create(scr);
+    lv_obj_remove_style_all(assistant_text_box);
+    lv_obj_set_size(assistant_text_box, 470, 180);
+    lv_obj_align(assistant_text_box, LV_ALIGN_TOP_LEFT, 300, 178);
+    lv_obj_set_style_bg_opa(assistant_text_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(assistant_text_box, 8, 0);
+    lv_obj_set_style_pad_all(assistant_text_box, 8, 0);
+    lv_obj_set_scroll_dir(assistant_text_box, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(assistant_text_box, LV_SCROLLBAR_MODE_AUTO);
+
+    assistant_text_label = lv_label_create(assistant_text_box);
     lv_label_set_text(assistant_text_label, assistant_text);
     lv_obj_set_style_text_color(assistant_text_label, lv_color_hex(0xa7f3d0), 0);
     ui_apply_chinese_font(assistant_text_label);
-    lv_obj_set_width(assistant_text_label, 430);
+    lv_obj_set_width(assistant_text_label, 454);
     lv_label_set_long_mode(assistant_text_label, LV_LABEL_LONG_WRAP);
-    lv_obj_align(assistant_text_label, LV_ALIGN_TOP_LEFT, 340, 178);
+    lv_obj_align(assistant_text_label, LV_ALIGN_TOP_LEFT, 0, 0);
     ui_set_avatar_visible_locked(false);
 
     reconnect_btn = lv_btn_create(scr);
@@ -1101,19 +1387,68 @@ static void create_ui(void)
     lv_obj_set_size(wifi_panel, LCD_H_RES, 210);
     lv_obj_align(wifi_panel, LV_ALIGN_TOP_LEFT, 0, 86);
 
-    wifi_dropdown = lv_dropdown_create(wifi_panel);
-    lv_obj_set_size(wifi_dropdown, 360, 52);
+    wifi_prov_title_label = lv_label_create(wifi_panel);
+    lv_label_set_text(wifi_prov_title_label, "BLE WiFi Provisioning");
+    lv_obj_set_style_text_color(wifi_prov_title_label, lv_color_hex(0x38bdf8), 0);
+    lv_obj_set_width(wifi_prov_title_label, LCD_H_RES - 80);
+    lv_obj_align(wifi_prov_title_label, LV_ALIGN_TOP_LEFT, 40, 2);
+
+    wifi_prov_state_label = lv_label_create(wifi_panel);
+    lv_label_set_text(wifi_prov_state_label, "Starting BLE provisioning...");
+    lv_obj_set_style_text_color(wifi_prov_state_label, lv_color_hex(0xe2e8f0), 0);
+    lv_obj_set_width(wifi_prov_state_label, LCD_H_RES - 80);
+    lv_label_set_long_mode(wifi_prov_state_label, LV_LABEL_LONG_WRAP);
+    lv_obj_align(wifi_prov_state_label, LV_ALIGN_TOP_LEFT, 40, 40);
+
+    wifi_prov_service_label = lv_label_create(wifi_panel);
+    lv_label_set_text(wifi_prov_service_label, "Device: pending");
+    lv_obj_set_style_text_color(wifi_prov_service_label, lv_color_hex(0xa7f3d0), 0);
+    lv_obj_set_width(wifi_prov_service_label, LCD_H_RES - 80);
+    lv_obj_align(wifi_prov_service_label, LV_ALIGN_TOP_LEFT, 40, 78);
+
+    wifi_prov_pop_label = lv_label_create(wifi_panel);
+    lv_label_set_text_fmt(wifi_prov_pop_label, "PoP: %s", CONFIG_KORVO_BLE_PROV_POP);
+    lv_obj_set_style_text_color(wifi_prov_pop_label, lv_color_hex(0xfacc15), 0);
+    lv_obj_set_width(wifi_prov_pop_label, LCD_H_RES - 80);
+    lv_obj_align(wifi_prov_pop_label, LV_ALIGN_TOP_LEFT, 40, 112);
+
+    lv_obj_t *manual_btn = lv_btn_create(wifi_panel);
+    lv_obj_set_size(manual_btn, 170, 52);
+    lv_obj_align(manual_btn, LV_ALIGN_TOP_LEFT, 40, 150);
+    lv_obj_set_style_bg_color(manual_btn, lv_color_hex(0x16a34a), 0);
+    lv_obj_add_event_cb(manual_btn, manual_wifi_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *manual_lbl = lv_label_create(manual_btn);
+    lv_label_set_text(manual_lbl, "Manual WiFi");
+    lv_obj_center(manual_lbl);
+
+    lv_obj_t *btn = lv_btn_create(wifi_panel);
+    lv_obj_set_size(btn, 150, 52);
+    lv_obj_align(btn, LV_ALIGN_TOP_LEFT, 240, 150);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0xff4444), 0);
+    lv_obj_add_event_cb(btn, btn_beep_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, "Beep");
+    lv_obj_center(lbl);
+
+    wifi_manual_panel = lv_obj_create(wifi_panel);
+    lv_obj_remove_style_all(wifi_manual_panel);
+    lv_obj_set_size(wifi_manual_panel, LCD_H_RES, 210);
+    lv_obj_align(wifi_manual_panel, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_add_flag(wifi_manual_panel, LV_OBJ_FLAG_HIDDEN);
+
+    selected_wifi_label = lv_label_create(wifi_manual_panel);
+    lv_label_set_text(selected_wifi_label, "Selected: none");
+    lv_obj_set_style_text_color(selected_wifi_label, lv_color_hex(0xe2e8f0), 0);
+    lv_obj_set_width(selected_wifi_label, LCD_H_RES - 80);
+    lv_obj_align(selected_wifi_label, LV_ALIGN_TOP_LEFT, 40, 2);
+
+    wifi_dropdown = lv_dropdown_create(wifi_manual_panel);
+    lv_obj_set_size(wifi_dropdown, 360, 46);
     lv_obj_align(wifi_dropdown, LV_ALIGN_TOP_LEFT, 40, 34);
     lv_dropdown_set_options(wifi_dropdown, "Scan WiFi first");
     lv_obj_add_event_cb(wifi_dropdown, wifi_ssid_selected_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    selected_wifi_label = lv_label_create(wifi_panel);
-    lv_label_set_text(selected_wifi_label, "Selected: none");
-    lv_obj_set_style_text_color(selected_wifi_label, lv_color_hex(0xe2e8f0), 0);
-    lv_obj_set_width(selected_wifi_label, 700);
-    lv_obj_align(selected_wifi_label, LV_ALIGN_TOP_LEFT, 40, 2);
-
-    wifi_password_ta = lv_textarea_create(wifi_panel);
+    wifi_password_ta = lv_textarea_create(wifi_manual_panel);
     lv_obj_set_size(wifi_password_ta, 340, 46);
     lv_obj_align(wifi_password_ta, LV_ALIGN_TOP_LEFT, 420, 34);
     lv_textarea_set_one_line(wifi_password_ta, true);
@@ -1122,32 +1457,32 @@ static void create_ui(void)
     lv_textarea_set_placeholder_text(wifi_password_ta, "Password");
     lv_obj_add_event_cb(wifi_password_ta, wifi_password_focus_cb, LV_EVENT_ALL, NULL);
 
-    lv_obj_t *scan_btn = lv_btn_create(wifi_panel);
-    lv_obj_set_size(scan_btn, 150, 52);
-    lv_obj_align(scan_btn, LV_ALIGN_TOP_LEFT, 40, 114);
+    lv_obj_t *scan_btn = lv_btn_create(wifi_manual_panel);
+    lv_obj_set_size(scan_btn, 150, 48);
+    lv_obj_align(scan_btn, LV_ALIGN_TOP_LEFT, 40, 104);
     lv_obj_set_style_bg_color(scan_btn, lv_color_hex(0x2563eb), 0);
     lv_obj_add_event_cb(scan_btn, wifi_scan_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *scan_lbl = lv_label_create(scan_btn);
     lv_label_set_text(scan_lbl, "Scan");
     lv_obj_center(scan_lbl);
 
-    lv_obj_t *connect_btn = lv_btn_create(wifi_panel);
-    lv_obj_set_size(connect_btn, 170, 52);
-    lv_obj_align(connect_btn, LV_ALIGN_TOP_LEFT, 220, 114);
+    lv_obj_t *connect_btn = lv_btn_create(wifi_manual_panel);
+    lv_obj_set_size(connect_btn, 170, 48);
+    lv_obj_align(connect_btn, LV_ALIGN_TOP_LEFT, 220, 104);
     lv_obj_set_style_bg_color(connect_btn, lv_color_hex(0x16a34a), 0);
-    lv_obj_add_event_cb(connect_btn, wifi_connect_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(connect_btn, wifi_manual_connect_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *connect_lbl = lv_label_create(connect_btn);
     lv_label_set_text(connect_lbl, "Connect");
     lv_obj_center(connect_lbl);
 
-    lv_obj_t *btn = lv_btn_create(wifi_panel);
-    lv_obj_set_size(btn, 150, 52);
-    lv_obj_align(btn, LV_ALIGN_TOP_LEFT, 420, 114);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0xff4444), 0);
-    lv_obj_add_event_cb(btn, btn_beep_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl = lv_label_create(btn);
-    lv_label_set_text(lbl, "Beep");
-    lv_obj_center(lbl);
+    lv_obj_t *back_ble_btn = lv_btn_create(wifi_manual_panel);
+    lv_obj_set_size(back_ble_btn, 150, 48);
+    lv_obj_align(back_ble_btn, LV_ALIGN_TOP_LEFT, 420, 104);
+    lv_obj_set_style_bg_color(back_ble_btn, lv_color_hex(0x64748b), 0);
+    lv_obj_add_event_cb(back_ble_btn, ble_wifi_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_ble_lbl = lv_label_create(back_ble_btn);
+    lv_label_set_text(back_ble_lbl, "Back BLE");
+    lv_obj_center(back_ble_lbl);
 
     status_label = lv_label_create(scr);
     lv_label_set_text(status_label, "Ready");
@@ -1250,6 +1585,7 @@ void app_main(void)
     _lock_acquire(&lvgl_lock);
     create_ui();
     _lock_release(&lvgl_lock);
+    xTaskCreate(ble_provisioning_task, "ble_prov", 6144, NULL, 3, NULL);
 
     ESP_LOGI(TAG, "All systems ready");
 }
